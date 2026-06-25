@@ -30,19 +30,42 @@ This is a v0.1 prototype. Please keep the following in mind:
 
 ### Requirements
 
-- Python 3.8+
+- Go 1.18+ (with CGO enabled)
+- A C compiler (GCC or Clang) for compiling Tree-sitter parser grammars
 - An OpenAI API key (for OpenAI models) or an OpenRouter API key (for other providers)
 - Optional: [ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`) for triage grep lookups
-- Optional: [Google codesearch](https://github.com/google/codesearch) (`csearch`/`cindex`) for faster grep on large repos
 
-### Install
+### Install & Build
 
 ```bash
 git clone https://github.com/weareaisle/nano-analyzer.git
 cd nano-analyzer
-# No dependency installation needed. Run directly:
-python3 scan.py --help
+# Build Go executable (native)
+go build -o nano-analyzer .
+# Run:
+./nano-analyzer --help
 ```
+
+### Cross-Compilation
+
+Since `nano-analyzer` requires CGO (for SQLite and Tree-sitter grammars), cross-compiling requires a target C toolchain.
+
+#### Target: Intel Mac (`darwin/amd64`)
+On macOS, Clang can target `x86_64` natively:
+```bash
+CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 go build -o nano-analyzer-amd64 .
+```
+
+#### Target: Linux (`linux/amd64`)
+We recommend using **Zig** as a drop-in C compiler to cross-compile and statically link C libraries:
+1. Install Zig:
+   ```bash
+   brew install zig
+   ```
+2. Build static binary using `zig cc`:
+   ```bash
+   CGO_ENABLED=1 GOOS=linux GOARCH=amd64 CC="zig cc -target x86_64-linux-musl" go build -o nano-analyzer-linux-amd64 .
+   ```
 
 ### API keys
 
@@ -64,29 +87,32 @@ The scanner determines which key to use based on the model name: if it contains 
 
 ```bash
 # Scan a single file
-python3 scan.py ./path/to/file.c
+./nano-analyzer ./path/to/file.c
 
 # Scan a directory recursively
-python3 scan.py ./path/to/src/
+./nano-analyzer ./path/to/src/
 ```
 
 ### Common options
 
 ```bash
 # Use a different model
-python3 scan.py ./src --model gpt-5.4
+./nano-analyzer ./src --model gpt-5.4
 
 # Control parallelism
-python3 scan.py ./src --parallel 30
+./nano-analyzer ./src --parallel 30
+
+# Bypass SQLite Cache and force fresh LLM calls
+./nano-analyzer ./src --no-cache
+
+# Clear current cached entries before scan begins
+./nano-analyzer ./src --clear-cache
+
+# Specify a custom location for SQLite database cache
+./nano-analyzer ./src --db-path ./my-cache.db
 
 # Point triage grep at the full repo root (useful when scanning a subdirectory)
-python3 scan.py ./lib/crypto/ --repo-dir ./
-
-# Only surface high-confidence findings
-python3 scan.py ./src --min-confidence 0.7
-
-# More triage rounds for higher accuracy (default: 5)
-python3 scan.py ./src --triage-rounds 7
+./nano-analyzer ./lib/crypto/ --repo-dir ./
 ```
 
 ### All flags
@@ -94,18 +120,21 @@ python3 scan.py ./src --triage-rounds 7
 | Flag | Default | Description |
 |------|---------|-------------|
 | `path` | *(required)* | File or directory to scan |
-| `--model` | `gpt-5.4-nano` | Model for all stages (context, scan, triage) |
-| `--parallel` | `50` | Max concurrent scan API calls |
-| `--triage-threshold` | `medium` | Triage findings at or above this severity |
-| `--triage-rounds` | `5` | Triage rounds per finding |
-| `--triage-parallel` | `50` | Max concurrent triage API calls |
-| `--max-connections` | `parallel + triage-parallel` | Total API call cap |
-| `--min-confidence` | `0.0` | Only show findings above this confidence (0.0–1.0) |
-| `--project` | directory name | Project name used in triage prompts |
-| `--repo-dir` | auto | Repo root for grep lookups (auto: parent dir for files, scan dir for folders) |
-| `--output-dir` | `~/nano-analyzer-results/<timestamp>/` | Where to save results |
-| `--max-chars` | `200,000` | Skip files larger than this |
-| `--verbose-triage` | off | Show per-round triage progress |
+| `-model` | `gpt-5.4-nano` | Model for all stages (context, scan, triage) |
+| `-parallel` | `50` | Max concurrent scan API calls |
+| `-triage-threshold` | `medium` | Triage findings at or above this severity |
+| `-triage-rounds` | `5` | Triage rounds per finding |
+| `-triage-parallel` | `50` | Max concurrent triage API calls |
+| `-max-connections` | `parallel + triage-parallel` | Total API call cap |
+| `-min-confidence` | `0.0` | Only show findings above this confidence (0.0–1.0) |
+| `-project` | directory name | Project name used in triage prompts |
+| `-repo-dir` | auto | Repo root for grep lookups (auto: parent dir for files, scan dir for folders) |
+| `-output-dir` | `~/nano-analyzer-results/<timestamp>/` | Where to save results |
+| `-max-chars` | `200,000` | Skip files larger than this |
+| `-verbose-triage` | off | Show per-round triage progress |
+| `-db-path` | `~/.nano-analyzer/nano-analyzer.db` | SQLite database file location |
+| `-no-cache` | off | Force fresh scans bypassing SQLite Cache |
+| `-clear-cache` | off | Delete existing scanning & triage cache records |
 
 ## Output
 

@@ -1,3 +1,20 @@
-.venv
+# Go binaries
+/nano-analyzer
+/nano-analyzer-amd64
+/nano-analyzer-linux-amd64
+
+# Database and Caches
+*.db
+*.db-shm
+*.db-wal
+
+# Scan Outputs
+nano-analyzer-results/
+
+# Editor/OS specific
+.DS_Store
 .idea/
+
+# Legacy Python envs
+.venv
 __pycache__/
