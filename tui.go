@@ -381,7 +381,8 @@ func (m BubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "down", "j":
 			switch m.state {
 			case StateExplorer:
-				if m.selectedFileIdx < len(m.files)-1 {
+				findings := m.getFindings()
+				if m.selectedFileIdx < len(findings)-1 {
 					m.selectedFileIdx++
 				}
 			case StateFileMenu:
@@ -443,46 +444,43 @@ func (m BubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter":
 			switch m.state {
 			case StateExplorer:
-				if len(m.files) > 0 {
+				findings := m.getFindings()
+				if len(findings) > 0 && m.selectedFileIdx < len(findings) {
 					m.state = StateFileMenu
 					m.selectedMenuIdx = 0
 				}
 			case StateFileMenu:
-				file := m.files[m.selectedFileIdx]
-				switch m.selectedMenuIdx {
-				case 0: // View Context
-					m.viewTitle = "Context Briefing: " + file.Filepath
-					m.viewTextLines = strings.Split(file.Context, "\n")
-					m.viewTextOffset = 0
-					m.state = StateTextViewer
-				case 1: // View Report
-					m.viewTitle = "Scan Report Findings: " + file.Filepath
-					m.viewTextLines = strings.Split(file.Report, "\n")
-					m.viewTextOffset = 0
-					m.state = StateTextViewer
-				case 2: // View Triages
-					m.state = StateTriageViewer
-					m.selectedTriageIdx = 0
-				case 3: // Back
+				findings := m.getFindings()
+				if len(findings) == 0 || m.selectedFileIdx >= len(findings) {
 					m.state = StateExplorer
+					return m, nil
 				}
-			case StateTriageViewer:
-				file := m.files[m.selectedFileIdx]
-				if len(file.Triages) > 0 && m.selectedTriageIdx < len(file.Triages) {
-					triage := file.Triages[m.selectedTriageIdx]
-					m.viewTitle = "Triage Verdict: " + triage.FindingTitle
+				finding := findings[m.selectedFileIdx]
+
+				// Find corresponding file item in m.files
+				var file TUIFileItem
+				for _, f := range m.files {
+					if f.Filepath == finding.File {
+						file = f
+						break
+					}
+				}
+
+				switch m.selectedMenuIdx {
+				case 0: // View Verdict & Triage Details
+					m.viewTitle = "Triage Verdict: " + finding.FindingTitle
 
 					var sb strings.Builder
-					sb.WriteString(fmt.Sprintf("Finding: %s\n", triage.FindingTitle))
-					sb.WriteString(fmt.Sprintf("Verdict: %s (Confidence: %.0f%%)\n", triage.Verdict, triage.Confidence*100))
-					sb.WriteString(fmt.Sprintf("Voters: %s\n\n", triage.VerdictsStr))
+					sb.WriteString(fmt.Sprintf("Finding: %s\n", finding.FindingTitle))
+					sb.WriteString(fmt.Sprintf("Verdict: %s (Confidence: %.0f%%)\n", finding.Verdict, finding.Confidence*100))
+					sb.WriteString(fmt.Sprintf("Voters: %s\n\n", finding.VerdictsStr))
 					sb.WriteString("=== Final Triage Decision Reasoning ===\n")
-					sb.WriteString(triage.Reasoning)
+					sb.WriteString(finding.Reasoning)
 					sb.WriteString("\n\n")
 
-					if len(triage.AllRounds) > 0 {
+					if len(finding.AllRounds) > 0 {
 						sb.WriteString("=== Skeptical Review Multi-Rounds ===\n")
-						for _, r := range triage.AllRounds {
+						for _, r := range finding.AllRounds {
 							sb.WriteString(fmt.Sprintf("[Round %d] Verdict: %s | Confidence: %.0f%%\n", r.Round, r.Verdict, r.Confidence*100))
 							sb.WriteString(fmt.Sprintf("Grep Lookup: %v\n", r.GrepUsed))
 							if r.GrepUsed {
@@ -495,7 +493,22 @@ func (m BubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 					m.viewTextLines = strings.Split(sb.String(), "\n")
 					m.viewTextOffset = 0
-					m.state = StateTriageDetailViewer
+					m.state = StateTextViewer
+
+				case 1: // View Context Briefing
+					m.viewTitle = "Context Briefing: " + file.Filepath
+					m.viewTextLines = strings.Split(file.Context, "\n")
+					m.viewTextOffset = 0
+					m.state = StateTextViewer
+
+				case 2: // View Scan Report
+					m.viewTitle = "Scan Report Findings: " + file.Filepath
+					m.viewTextLines = strings.Split(file.Report, "\n")
+					m.viewTextOffset = 0
+					m.state = StateTextViewer
+
+				case 3: // Back
+					m.state = StateExplorer
 				}
 			case StateQueueManager:
 				if m.inAddMode {
@@ -653,11 +666,23 @@ func (m BubbleModel) renderDashboard() string {
 
 func (m BubbleModel) renderExplorer() string {
 	var sb strings.Builder
-	sb.WriteString(whiteStyle.Render("🎯 SELECT A FILE TO EXPLORE RESULT DETAILS:") + "\n\n")
+	sb.WriteString(whiteStyle.Render("🎯 SELECT A VULNERABILITY FINDING TO EXPLORE DETAILS:") + "\n\n")
+
+	findings := m.getFindings()
 
 	listHeight := m.terminalHeight - 8
 	if listHeight < 5 {
 		listHeight = 5
+	}
+
+	if len(findings) == 0 {
+		sb.WriteString(greyStyle.Render("No vulnerability findings detected yet.") + "\n")
+		// Pad blank lines
+		for i := 0; i < listHeight; i++ {
+			sb.WriteString("\n")
+		}
+		sb.WriteString("\n" + greyStyle.Render(" [Tab] Dashboard | [m] Manage Queue | [Q/Esc] Back "))
+		return sb.String()
 	}
 
 	// Calculate bounds
@@ -666,8 +691,8 @@ func (m BubbleModel) renderExplorer() string {
 		startIdx = 0
 	}
 	endIdx := startIdx + listHeight
-	if endIdx > len(m.files) {
-		endIdx = len(m.files)
+	if endIdx > len(findings) {
+		endIdx = len(findings)
 		startIdx = endIdx - listHeight
 		if startIdx < 0 {
 			startIdx = 0
@@ -675,8 +700,8 @@ func (m BubbleModel) renderExplorer() string {
 	}
 
 	for i := startIdx; i < endIdx; i++ {
-		file := m.files[i]
-		relPath := file.Filepath
+		finding := findings[i]
+		relPath := finding.File
 		if strings.HasPrefix(relPath, m.targetPath) {
 			relPath = strings.TrimPrefix(relPath, m.targetPath)
 			relPath = strings.TrimPrefix(relPath, "/")
@@ -687,28 +712,16 @@ func (m BubbleModel) renderExplorer() string {
 			cursor = "👉"
 		}
 
-		statusSymbol := "⬜"
-		if file.Scanned {
-			if file.Status == "success" {
-				if file.Severities["critical"] > 0 || file.Severities["high"] > 0 {
-					statusSymbol = "🔴"
-				} else if file.Severities["medium"] > 0 {
-					statusSymbol = "🟡"
-				} else {
-					statusSymbol = "🟢"
-				}
-			} else if file.Status == "error" {
-				statusSymbol = "❌"
-			}
+		verdictSymbol := "🟢" // valid / default
+		if finding.Verdict == "INVALID" || finding.Verdict == "REJECTED" {
+			verdictSymbol = "❌"
+		} else if finding.Verdict == "UNCERTAIN" {
+			verdictSymbol = "🟡"
+		} else if finding.Verdict == "VALID" {
+			verdictSymbol = "🔴"
 		}
 
-		sevSummary := ""
-		if file.Scanned && file.Status == "success" {
-			sevSummary = fmt.Sprintf(" (Crit:%d, High:%d, Med:%d, Low:%d)",
-				file.Severities["critical"], file.Severities["high"], file.Severities["medium"], file.Severities["low"])
-		}
-
-		line := fmt.Sprintf("%s %s %s%s", cursor, statusSymbol, relPath, sevSummary)
+		line := fmt.Sprintf("%s %s %s: %s (Confidence: %.0f%%)", cursor, verdictSymbol, relPath, finding.FindingTitle, finding.Confidence*100)
 		if i == m.selectedFileIdx {
 			sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFFF87")).Render(line) + "\n")
 		} else {
@@ -721,26 +734,30 @@ func (m BubbleModel) renderExplorer() string {
 		sb.WriteString("\n")
 	}
 
-	sb.WriteString("\n" + greyStyle.Render(" [Tab] Dashboard | [m] Manage Queue | [Up/Down] Navigate | [Enter] Select file | [Q/Esc] Back "))
+	sb.WriteString("\n" + greyStyle.Render(" [Tab] Dashboard | [m] Manage Queue | [Up/Down] Navigate | [Enter] Select finding | [Q/Esc] Back "))
 	return sb.String()
 }
 
 func (m BubbleModel) renderFileMenu() string {
-	file := m.files[m.selectedFileIdx]
-	relPath := file.Filepath
+	findings := m.getFindings()
+	if len(findings) == 0 || m.selectedFileIdx >= len(findings) {
+		return ""
+	}
+	finding := findings[m.selectedFileIdx]
+	relPath := finding.File
 	if strings.HasPrefix(relPath, m.targetPath) {
 		relPath = strings.TrimPrefix(relPath, m.targetPath)
 		relPath = strings.TrimPrefix(relPath, "/")
 	}
 
 	var sb strings.Builder
-	sb.WriteString(whiteStyle.Render(fmt.Sprintf("📂 File: %s", relPath)) + "\n\n")
+	sb.WriteString(whiteStyle.Render(fmt.Sprintf("📂 Finding: %s (%s)", finding.FindingTitle, relPath)) + "\n\n")
 
 	options := []string{
-		"1. View Context Briefing (Stage 1)",
-		"2. View Scan Report Findings (Stage 2)",
-		"3. View Triage Decisions & Reviews (Stage 3)",
-		"4. Back to file list",
+		"1. View Verdict Details & Triage Reasoning (Stage 3)",
+		"2. View File Context Briefing (Stage 1)",
+		"3. View File Scan Report Findings (Stage 2)",
+		"4. Back to findings list",
 	}
 
 	for i, opt := range options {
@@ -895,6 +912,15 @@ func (m BubbleModel) renderQueueManager() string {
 		}
 		sb.WriteString("\n" + greyStyle.Render(" [Up/Down] Select | [a/+] Add file | [d/x] Remove | [K] Move Up | [J] Move Down | [Esc/m] Back "))
 	}
-
 	return sb.String()
+}
+
+func (m BubbleModel) getFindings() []TriageResult {
+	var findings []TriageResult
+	for _, file := range m.files {
+		for _, tr := range file.Triages {
+			findings = append(findings, tr)
+		}
+	}
+	return findings
 }
