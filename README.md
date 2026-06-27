@@ -129,19 +129,30 @@ The scanner determines which key to use based on the model name: if it contains 
 | `-min-confidence` | `0.0` | Only show findings above this confidence (0.0–1.0) |
 | `-project` | directory name | Project name used in triage prompts |
 | `-repo-dir` | auto | Repo root for grep lookups (auto: parent dir for files, scan dir for folders) |
-| `-output-dir` | `~/nano-analyzer-results/<timestamp>/` | Where to save results |
+| `-output-dir` | `""` (disabled) | Where to save results as local files. If empty, local file output is disabled and all results are stored only in the SQLite DB. |
 | `-max-chars` | `200,000` | Skip files larger than this |
 | `-verbose-triage` | off | Show per-round triage progress |
 | `-db-path` | `~/.nano-analyzer/nano-analyzer.db` | SQLite database file location |
 | `-no-cache` | off | Force fresh scans bypassing SQLite Cache |
 | `-clear-cache` | off | Delete existing scanning & triage cache records |
+| `-tui` | `true` | Enable the interactive AFL-style Bubble Tea terminal UI status dashboard and results explorer |
+
+## Interactive TUI Mode
+
+By default, `nano-analyzer` launches an interactive Bubble Tea terminal user interface. The UI features:
+- **Dashboard**: Real-time event statistics including execution duration, API concurrency slots, total OpenRouter API calls made, and a live log stream.
+- **Results Explorer**: Press `Tab` to switch to the Results Explorer screen. Select any scanned file using `Up`/`Down` and `Enter` to explore vulnerability briefing reports, scan details, and multi-round skeptical reviewer debates.
+- **Interactive Queue Manager**: Press `m` on the Dashboard or Explorer to manage the active scan queue dynamically. Rearrange files (using `K`/`J`), remove/exclude files from scanning (using `d`/`x`), or add unscanned files (using `a`/`+`).
+- **Pause & Resume**: Press `p` on the Dashboard to pause background scanning at any moment and resume it when ready.
+
+If you prefer logging output directly to the standard terminal instead of the TUI, set the `--tui=false` flag.
 
 ## Output
 
-Results are saved to `~/nano-analyzer-results/<timestamp>/` (or `--output-dir`):
+By default, all results are stored in the SQLite database cache (`~/.nano-analyzer/nano-analyzer.db`). If you specify an `--output-dir` path, results are also written locally in Markdown and JSON files:
 
 ```
-<timestamp>/
+<output-dir>/
 ├── summary.json              # machine-readable scan summary
 ├── summary.md                # human-readable scan summary
 ├── <filename>.md             # raw scanner output per file

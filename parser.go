@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
@@ -322,3 +324,183 @@ func GenerateSemanticBriefing(info *ParsedFileInfo) string {
 	sb.WriteString("\n")
 	return sb.String()
 }
+
+// GetFunctionCode parses a file, traverses the AST to find a function matching targetFuncName, and returns its source code.
+func GetFunctionCode(filepathStr, targetFuncName string) (string, error) {
+	codeBytes, err := os.ReadFile(filepathStr)
+	if err != nil {
+		return "", err
+	}
+	ext := filepath.Ext(filepathStr)
+	lang := GetLanguageGrammar(ext)
+	if lang == nil {
+		return "", fmt.Errorf("unsupported language for tree-sitter parsing: %s", ext)
+	}
+
+	parser := sitter.NewParser()
+	defer parser.Close()
+	parser.SetLanguage(lang)
+
+	tree, err := parser.ParseCtx(context.Background(), nil, codeBytes)
+	if err != nil {
+		return "", err
+	}
+	defer tree.Close()
+
+	node := findFunctionNode(tree.RootNode(), codeBytes, targetFuncName)
+	if node == nil {
+		return "", fmt.Errorf("function '%s' not found in AST of %s", targetFuncName, filepathStr)
+	}
+
+	return string(codeBytes[node.StartByte():node.EndByte()]), nil
+}
+
+func findFunctionNode(n *sitter.Node, code []byte, targetName string) *sitter.Node {
+	if n == nil {
+		return nil
+	}
+	nodeType := n.Type()
+	isFunc := false
+	switch nodeType {
+	case "function_declaration", "method_declaration", "function_definition", "function_item":
+		isFunc = true
+	}
+	if isFunc {
+		for i := 0; i < int(n.ChildCount()); i++ {
+			child := n.Child(i)
+			if child.Type() == "identifier" || child.Type() == "field_identifier" {
+				name := string(code[child.StartByte():child.EndByte()])
+				cleanTarget := strings.TrimSuffix(targetName, "()")
+				if name == cleanTarget {
+					return n
+				}
+			}
+		}
+	}
+	for i := 0; i < int(n.ChildCount()); i++ {
+		res := findFunctionNode(n.Child(i), code, targetName)
+		if res != nil {
+			return res
+		}
+	}
+	return nil
+}
+
+// GetASTSummary parses a file and returns its semantic briefing.
+func GetASTSummary(filepathStr string) (string, error) {
+	code, err := os.ReadFile(filepathStr)
+	if err != nil {
+		return "", err
+	}
+	ext := filepath.Ext(filepathStr)
+	info := ParseFileAST(code, ext)
+	if info == nil {
+		return "", fmt.Errorf("could not parse AST for %s", filepathStr)
+	}
+	return GenerateSemanticBriefing(info), nil
+}
+
+// FindSymbolDeclaration scans all source files in repoDir, parsing their ASTs to find a definition of the target symbol.
+func FindSymbolDeclaration(repoDir, symbol string) (string, error) {
+	var decls []string
+
+	err := filepath.Walk(repoDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		ext := filepath.Ext(path)
+		lang := GetLanguageGrammar(ext)
+		if lang == nil {
+			return nil // Skip files with unsupported extensions
+		}
+
+		// Quick check: does the file contain the symbol text?
+		codeBytes, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		if !strings.Contains(string(codeBytes), symbol) {
+			return nil
+		}
+
+		// Parse AST
+		parser := sitter.NewParser()
+		defer parser.Close()
+		parser.SetLanguage(lang)
+
+		tree, err := parser.ParseCtx(context.Background(), nil, codeBytes)
+		if err != nil {
+			return nil
+		}
+		defer tree.Close()
+
+		node := findSymbolDeclarationNode(tree.RootNode(), codeBytes, symbol)
+		if node != nil {
+			lineNum := int(node.StartPoint().Row) + 1
+			relPath, _ := filepath.Rel(repoDir, path)
+			
+			// Extract a snippet of the definition
+			snippet := string(codeBytes[node.StartByte():node.EndByte()])
+			// If snippet is too long, truncate it
+			lines := strings.Split(snippet, "\n")
+			if len(lines) > 20 {
+				snippet = strings.Join(lines[:20], "\n") + "\n... (truncated)"
+			}
+
+			decls = append(decls, fmt.Sprintf("File: %s:%d\n```\n%s\n```", relPath, lineNum, snippet))
+		}
+		return nil
+	})
+
+	if err != nil {
+		return "", err
+	}
+
+	if len(decls) == 0 {
+		return fmt.Sprintf("Symbol '%s' declaration not found in codebase.", symbol), nil
+	}
+
+	return strings.Join(decls, "\n\n"), nil
+}
+
+func findSymbolDeclarationNode(n *sitter.Node, code []byte, symbol string) *sitter.Node {
+	if n == nil {
+		return nil
+	}
+	nodeType := n.Type()
+	isDecl := false
+	switch nodeType {
+	case "function_declaration", "method_declaration", "function_definition", "function_item",
+		"class_declaration", "class_definition", "struct_specifier", "interface_declaration",
+		"type_spec", "type_declaration", "struct_type", "type_alias":
+		isDecl = true
+	}
+	if isDecl {
+		for i := 0; i < int(n.ChildCount()); i++ {
+			child := n.Child(i)
+			if child.Type() == "identifier" || child.Type() == "field_identifier" || child.Type() == "type_identifier" {
+				name := string(code[child.StartByte():child.EndByte()])
+				if name == symbol {
+					curr := n
+					for curr.Parent() != nil {
+						pType := curr.Parent().Type()
+						if pType == "type_declaration" || pType == "var_declaration" || pType == "const_declaration" {
+							curr = curr.Parent()
+						} else {
+							break
+						}
+					}
+					return curr
+				}
+			}
+		}
+	}
+	for i := 0; i < int(n.ChildCount()); i++ {
+		res := findSymbolDeclarationNode(n.Child(i), code, symbol)
+		if res != nil {
+			return res
+		}
+	}
+	return nil
+}
+

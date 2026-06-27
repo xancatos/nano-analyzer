@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,11 +22,12 @@ const (
 
 // DynamicSemaphore implements dynamic concurrency limits to back off in-flight requests during rate limits/errors
 type DynamicSemaphore struct {
-	mu       sync.Mutex
-	capacity int
-	maxCap   int
-	inFlight int
-	cond     *sync.Cond
+	mu           sync.Mutex
+	capacity     int
+	maxCap       int
+	inFlight     int
+	successCount int
+	cond         *sync.Cond
 }
 
 func NewDynamicSemaphore(maxCap int) *DynamicSemaphore {
@@ -56,25 +58,27 @@ func (s *DynamicSemaphore) Release() {
 func (s *DynamicSemaphore) Backoff() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Cut capacity in half down to a minimum of 1
+	// Instant drop to 1 connection
 	oldCap := s.capacity
-	s.capacity = s.capacity / 2
-	if s.capacity < 1 {
-		s.capacity = 1
-	}
+	s.capacity = 1
+	s.successCount = 0
 	if oldCap != s.capacity {
-		fmt.Printf("⚠️  [API Congestion] High error rate/rate limit. Reducing in-flight request cap from %d to %d\n", oldCap, s.capacity)
+		fmt.Printf("⚠️  [API Congestion] High error rate/rate limit. INSTANTLY reducing in-flight request cap from %d to %d\n", oldCap, s.capacity)
 	}
 }
 
 func (s *DynamicSemaphore) Recover() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Increment capacity slowly back to maxCap (additive increase)
+	// Increment capacity slowly back to maxCap (additive increase, e.g. every 10 successful requests)
 	if s.capacity < s.maxCap {
-		s.capacity++
-		fmt.Printf("✅ [API Recovered] Scaling up concurrent request capacity to %d (max: %d)\n", s.capacity, s.maxCap)
-		s.cond.Broadcast()
+		s.successCount++
+		if s.successCount >= 10 {
+			s.capacity++
+			s.successCount = 0
+			fmt.Printf("✅ [API Recovered] Scaling up concurrent request capacity to %d (max: %d)\n", s.capacity, s.maxCap)
+			s.cond.Broadcast()
+		}
 	}
 }
 
@@ -136,7 +140,15 @@ type APIBackend struct {
 
 // ResolveBackend determines OpenRouter vs OpenAI based on model name and environment variables
 func ResolveBackend(model string) (*APIBackend, error) {
-	if strings.Contains(model, "/") {
+	isOpenRouter := strings.Contains(model, "/") || strings.Contains(model, ":")
+	if !isOpenRouter {
+		// Fallback: if we have OPENROUTER_API_KEY and no OPENAI_API_KEY, use OpenRouter
+		if os.Getenv("OPENROUTER_API_KEY") != "" && os.Getenv("OPENAI_API_KEY") == "" {
+			isOpenRouter = true
+		}
+	}
+
+	if isOpenRouter {
 		apiKey := os.Getenv("OPENROUTER_API_KEY")
 		if apiKey == "" {
 			return nil, fmt.Errorf("Model '%s' routes through OpenRouter but OPENROUTER_API_KEY is not set. Set it via: export OPENROUTER_API_KEY=sk-or-...", model)
@@ -196,17 +208,24 @@ func CallLLM(model string, messages []ChatMessage, jsonMode bool, maxRetries int
 	var usage ChatUsage
 	var elapsed float64
 
-	// Try up to maxRetries + 2 additional retries for robustness against rate limit spikes
-	limit := maxRetries + 2
-
-	for attempt := 0; attempt < limit; attempt++ {
-		// Backoff sleep (exponential backoff)
+	for attempt := 0; ; attempt++ {
+		// Backoff sleep (exponential backoff capped at 30 seconds)
 		if attempt > 0 {
-			sleepDur := time.Duration(1<<attempt)*time.Second + time.Duration(rand.Float64()*2000)*time.Millisecond
+			if attempt >= 3 {
+				fmt.Printf("⚠️  [LLM Request Retrying] Attempt %d failed. Last error: %v. Retrying with backoff...\n", attempt, lastErr)
+			}
+			backoffSec := 1 << attempt
+			if backoffSec > 30 {
+				backoffSec = 30
+			}
+			sleepDur := time.Duration(backoffSec)*time.Second + time.Duration(rand.Float64()*2000)*time.Millisecond
 			time.Sleep(sleepDur)
 		} else {
 			time.Sleep(time.Duration(rand.Float64()*500) * time.Millisecond)
 		}
+
+		// Verify pause state
+		checkPause()
 
 		t0 := time.Now()
 
@@ -214,6 +233,9 @@ func CallLLM(model string, messages []ChatMessage, jsonMode bool, maxRetries int
 		if apiSemaphore != nil {
 			apiSemaphore.Acquire()
 		}
+
+		// Increment API call counter
+		atomic.AddInt64(&totalLLMCalls, 1)
 
 		req, err := http.NewRequest("POST", backend.URL, bytes.NewBuffer(payloadBytes))
 		if err != nil {
@@ -303,6 +325,23 @@ func CallLLM(model string, messages []ChatMessage, jsonMode bool, maxRetries int
 		if responseText == "" {
 			responseText = choice.Message.ReasoningContent
 		}
+
+		if responseText == "" {
+			if apiSemaphore != nil {
+				apiSemaphore.Backoff()
+			}
+			lastErr = fmt.Errorf("API returned empty choice content")
+			continue
+		}
+
+		if jsonMode && ExtractJSON(responseText) == nil {
+			if apiSemaphore != nil {
+				apiSemaphore.Backoff()
+			}
+			lastErr = fmt.Errorf("API response is not valid JSON under jsonMode: %q", responseText)
+			continue
+		}
+
 		usage = apiResp.Usage
 
 		// Success: trigger additive recovery for concurrent connection limit
@@ -312,8 +351,6 @@ func CallLLM(model string, messages []ChatMessage, jsonMode bool, maxRetries int
 
 		return responseText, usage, elapsed, nil
 	}
-
-	return "", ChatUsage{}, elapsed, fmt.Errorf("connection failed after %d retries. Last error: %w", limit, lastErr)
 }
 
 // ExtractJSON attempts to find and repair JSON structures in text

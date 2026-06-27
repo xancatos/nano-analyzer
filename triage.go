@@ -549,3 +549,60 @@ Based on the code and evidence, is this a real security vulnerability? Respond i
 		File:         filepath,
 	}, nil
 }
+
+// ExecuteSemanticRequests parses the LLM output for AST/semantic helper commands, executes them, and returns formatted results.
+func ExecuteSemanticRequests(responseRaw string, repoDir string) string {
+	if repoDir == "" {
+		return ""
+	}
+
+	var results []string
+
+	// 1. Parse GET_FUNCTION: <relative_path>::<funcname>
+	funcRx := regexp.MustCompile(`(?i)GET_FUNCTION:\s*([^\s:]+)::([^\s\n\r()]+)`)
+	for _, m := range funcRx.FindAllStringSubmatch(responseRaw, -1) {
+		relPath := strings.Trim(m[1], "`'\" ")
+		funcName := strings.Trim(m[2], "`'\" ")
+		absPath := filepath.Join(repoDir, relPath)
+
+		code, err := GetFunctionCode(absPath, funcName)
+		if err != nil {
+			results = append(results, fmt.Sprintf("GET_FUNCTION error on %s::%s: %v", relPath, funcName, err))
+		} else {
+			results = append(results, fmt.Sprintf("### Function definition: %s in %s\n```%s\n%s\n```", funcName, relPath, GetLanguageName(filepath.Ext(relPath)), code))
+		}
+	}
+
+	// 2. Parse GET_AST: <relative_path>
+	astRx := regexp.MustCompile(`(?i)GET_AST:\s*([^\s\n\r]+)`)
+	for _, m := range astRx.FindAllStringSubmatch(responseRaw, -1) {
+		relPath := strings.Trim(m[1], "`'\" ")
+		absPath := filepath.Join(repoDir, relPath)
+
+		astSummary, err := GetASTSummary(absPath)
+		if err != nil {
+			results = append(results, fmt.Sprintf("GET_AST error on %s: %v", relPath, err))
+		} else {
+			results = append(results, fmt.Sprintf("### AST summary for %s:\n%s", relPath, astSummary))
+		}
+	}
+
+	// 3. Parse FIND_DECLARATION: <symbol>
+	declRx := regexp.MustCompile(`(?i)FIND_DECLARATION:\s*([^\s\n\r]+)`)
+	for _, m := range declRx.FindAllStringSubmatch(responseRaw, -1) {
+		symbol := strings.Trim(m[1], "`'\" ")
+		declText, err := FindSymbolDeclaration(repoDir, symbol)
+		if err != nil {
+			results = append(results, fmt.Sprintf("FIND_DECLARATION error on %s: %v", symbol, err))
+		} else {
+			results = append(results, fmt.Sprintf("### Declarations found for '%s':\n%s", symbol, declText))
+		}
+	}
+
+	if len(results) == 0 {
+		return ""
+	}
+
+	return strings.Join(results, "\n\n")
+}
+

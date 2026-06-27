@@ -86,6 +86,7 @@ func InitDB(dbPath string) (*sql.DB, error) {
 			reasoning TEXT NOT NULL,
 			confidence REAL NOT NULL,
 			verdicts_str TEXT NOT NULL,
+			all_rounds TEXT,
 			triage_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
 			PRIMARY KEY (filepath, model, finding_title)
 		);`,
@@ -97,6 +98,9 @@ func InitDB(dbPath string) (*sql.DB, error) {
 			return nil, fmt.Errorf("failed to run migration: %w", err)
 		}
 	}
+
+	// Run migration to add all_rounds column if missing
+	_, _ = db.Exec("ALTER TABLE triage_cache ADD COLUMN all_rounds TEXT;")
 
 	if err := seedFileFocus(db); err != nil {
 		db.Close()
@@ -159,14 +163,19 @@ func GetFileFocus(db *sql.DB, ext string) (string, string) {
 }
 
 // GetCachedScan retrieves a cached scan result if the content hash matches
-func GetCachedScan(db *sql.DB, filepath, model, contentHash string) (*ScanResult, bool, error) {
+func GetCachedScan(db *sql.DB, filepathStr string, model, contentHash string) (*ScanResult, bool, error) {
+	absFP, err := filepath.Abs(filepathStr)
+	if err == nil {
+		filepathStr = absFP
+	}
+
 	var res ScanResult
 	var severitiesJSON string
 
 	query := `SELECT context, report, severities, status, error 
 	          FROM scan_cache 
 	          WHERE filepath = ? AND model = ? AND content_hash = ?`
-	err := db.QueryRow(query, filepath, model, contentHash).Scan(
+	err = db.QueryRow(query, filepathStr, model, contentHash).Scan(
 		&res.Context, &res.Report, &severitiesJSON, &res.Status, &res.Error,
 	)
 	if err == sql.ErrNoRows {
@@ -175,7 +184,7 @@ func GetCachedScan(db *sql.DB, filepath, model, contentHash string) (*ScanResult
 		return nil, false, err
 	}
 
-	res.File = filepath
+	res.File = filepathStr
 	res.Model = model
 
 	var sevs map[string]int
@@ -188,8 +197,12 @@ func GetCachedScan(db *sql.DB, filepath, model, contentHash string) (*ScanResult
 	return &res, true, nil
 }
 
-// SaveCachedScan saves a scan result to cache
 func SaveCachedScan(db *sql.DB, r *ScanResult, contentHash string) error {
+	absFP, err := filepath.Abs(r.File)
+	if err == nil {
+		r.File = absFP
+	}
+
 	sevsJSON, err := json.Marshal(r.Severities)
 	if err != nil {
 		sevsJSON = []byte("{}")
@@ -209,12 +222,16 @@ func SaveCachedScan(db *sql.DB, r *ScanResult, contentHash string) error {
 	return err
 }
 
-// GetCachedTriages retrieves all cached triage results for a given file and model
-func GetCachedTriages(db *sql.DB, filepath, model string) ([]TriageResult, error) {
-	query := `SELECT finding_title, verdict, reasoning, confidence, verdicts_str 
+func GetCachedTriages(db *sql.DB, filepathStr string, model string) ([]TriageResult, error) {
+	absFP, err := filepath.Abs(filepathStr)
+	if err == nil {
+		filepathStr = absFP
+	}
+
+	query := `SELECT finding_title, verdict, reasoning, confidence, verdicts_str, all_rounds 
 	          FROM triage_cache 
 	          WHERE filepath = ? AND model = ?`
-	rows, err := db.Query(query, filepath, model)
+	rows, err := db.Query(query, filepathStr, model)
 	if err != nil {
 		return nil, err
 	}
@@ -223,27 +240,37 @@ func GetCachedTriages(db *sql.DB, filepath, model string) ([]TriageResult, error
 	var results []TriageResult
 	for rows.Next() {
 		var tr TriageResult
-		tr.File = filepath
-		err := rows.Scan(&tr.FindingTitle, &tr.Verdict, &tr.Reasoning, &tr.Confidence, &tr.VerdictsStr)
+		tr.File = filepathStr
+		var roundsJSON sql.NullString
+		err := rows.Scan(&tr.FindingTitle, &tr.Verdict, &tr.Reasoning, &tr.Confidence, &tr.VerdictsStr, &roundsJSON)
 		if err != nil {
 			return nil, err
+		}
+		if roundsJSON.Valid && roundsJSON.String != "" {
+			_ = json.Unmarshal([]byte(roundsJSON.String), &tr.AllRounds)
 		}
 		results = append(results, tr)
 	}
 	return results, nil
 }
 
-// SaveCachedTriage saves a triage result to cache
-func SaveCachedTriage(db *sql.DB, filepath, model string, t *TriageResult) error {
-	query := `INSERT INTO triage_cache (filepath, model, finding_title, verdict, reasoning, confidence, verdicts_str, triage_timestamp)
-	          VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+func SaveCachedTriage(db *sql.DB, filepathStr string, model string, t *TriageResult) error {
+	absFP, err := filepath.Abs(filepathStr)
+	if err == nil {
+		filepathStr = absFP
+	}
+
+	roundsJSON, _ := json.Marshal(t.AllRounds)
+	query := `INSERT INTO triage_cache (filepath, model, finding_title, verdict, reasoning, confidence, verdicts_str, all_rounds, triage_timestamp)
+	          VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 	          ON CONFLICT(filepath, model, finding_title) DO UPDATE SET
 	            verdict = excluded.verdict,
 	            reasoning = excluded.reasoning,
 	            confidence = excluded.confidence,
 	            verdicts_str = excluded.verdicts_str,
+	            all_rounds = excluded.all_rounds,
 	            triage_timestamp = CURRENT_TIMESTAMP`
-	_, err := db.Exec(query, filepath, model, t.FindingTitle, t.Verdict, t.Reasoning, t.Confidence, t.VerdictsStr)
+	_, err = db.Exec(query, filepathStr, model, t.FindingTitle, t.Verdict, t.Reasoning, t.Confidence, t.VerdictsStr, string(roundsJSON))
 	return err
 }
 
